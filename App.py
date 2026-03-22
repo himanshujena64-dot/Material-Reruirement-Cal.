@@ -5,14 +5,21 @@ from io import BytesIO
 st.title("📊 MRP Shortage Tool")
 
 # =========================
-# SAFE EXCEL READER (NO ERROR)
+# SAFE EXCEL READER
 # =========================
-def read_excel_safe(file, sheet_name=None):
+def read_excel_safe(uploaded_file, sheet_name=None):
     try:
-        return pd.read_excel(file, dtype=str, sheet_name=sheet_name)
-    except:
-        data = BytesIO(file.read())
-        return pd.read_excel(data, dtype=str, sheet_name=sheet_name)
+        data = BytesIO(uploaded_file.read())
+
+        try:
+            return pd.read_excel(data, sheet_name=sheet_name, dtype=str, engine="openpyxl")
+        except:
+            data.seek(0)
+            return pd.read_excel(data, sheet_name=sheet_name, dtype=str)
+
+    except Exception as e:
+        st.error(f"Excel read failed: {e}")
+        st.stop()
 
 # =========================
 # FILE UPLOAD
@@ -24,13 +31,16 @@ if st.button("Run MRP"):
 
     if bom_file and req_file:
 
-        try:
-            bom = read_excel_safe(bom_file)
-            req = read_excel_safe(req_file, sheet_name="Requirement")
-            stock = read_excel_safe(req_file, sheet_name="Stock")
-        except Exception as e:
-            st.error(f"Error reading Excel file: {e}")
-            st.stop()
+        # =========================
+        # READ FILES (FIXED)
+        # =========================
+        bom = read_excel_safe(bom_file)
+
+        req_file.seek(0)
+        req = read_excel_safe(req_file, sheet_name="Requirement")
+
+        req_file.seek(0)
+        stock = read_excel_safe(req_file, sheet_name="Stock")
 
         # =========================
         # CLEAN
@@ -130,7 +140,7 @@ if st.button("Run MRP"):
             if merged.empty:
                 continue
 
-            # Phantom pass-through
+            # Phantom logic
             merged["Required"] = merged.apply(
                 lambda x: x["Demand"] if str(x["Special procurement"]) == "50"
                 else x["Demand"] * x["Quantity"],
@@ -150,7 +160,7 @@ if st.button("Run MRP"):
 
             results.append(grouped)
 
-            # 🔥 CRITICAL FIX
+            # 🔥 FIX: CONSOLIDATE DEMAND
             grouped["Demand"] = grouped["Shortage"]
 
             current = grouped.groupby(
@@ -174,8 +184,16 @@ if st.button("Run MRP"):
         # =========================
         # DOWNLOAD
         # =========================
-        csv = pivot.to_csv(index=False).encode("utf-8")
-        st.download_button("Download Output", csv, "MRP_Output.csv", "text/csv")
+        output = BytesIO()
+        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+            pivot.to_excel(writer, index=False)
+
+        st.download_button(
+            label="Download Excel",
+            data=output.getvalue(),
+            file_name="MRP_Output.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
 
     else:
         st.warning("Please upload both files")
