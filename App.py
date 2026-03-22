@@ -5,18 +5,11 @@ from io import BytesIO
 st.title("📊 MRP Shortage Tool")
 
 # =========================
-# SAFE EXCEL READER
+# SAFE EXCEL READER (FINAL)
 # =========================
 def read_excel_safe(uploaded_file, sheet_name=None):
     try:
-        data = BytesIO(uploaded_file.read())
-
-        try:
-            return pd.read_excel(data, sheet_name=sheet_name, dtype=str, engine="openpyxl")
-        except:
-            data.seek(0)
-            return pd.read_excel(data, sheet_name=sheet_name, dtype=str)
-
+        return pd.read_excel(uploaded_file, sheet_name=sheet_name, dtype=str, engine="openpyxl")
     except Exception as e:
         st.error(f"Excel read failed: {e}")
         st.stop()
@@ -32,14 +25,10 @@ if st.button("Run MRP"):
     if bom_file and req_file:
 
         # =========================
-        # READ FILES (FIXED)
+        # READ FILES
         # =========================
         bom = read_excel_safe(bom_file)
-
-        req_file.seek(0)
         req = read_excel_safe(req_file, sheet_name="Requirement")
-
-        req_file.seek(0)
         stock = read_excel_safe(req_file, sheet_name="Stock")
 
         # =========================
@@ -69,7 +58,7 @@ if st.button("Run MRP"):
         req["BOM Header"] = req["BOM Header"].apply(normalize)
 
         # =========================
-        # NUMERIC
+        # NUMERIC FIX
         # =========================
         bom["Level"] = pd.to_numeric(bom["Level"], errors="coerce")
 
@@ -86,7 +75,7 @@ if st.button("Run MRP"):
         stock["Stock"] = pd.to_numeric(stock["Stock"], errors="coerce").fillna(0)
 
         # =========================
-        # CREATE PARENT
+        # CREATE PARENT COMPONENT
         # =========================
         parents = []
         stack = {}
@@ -106,7 +95,7 @@ if st.button("Run MRP"):
         bom["Parent Component"] = parents
 
         # =========================
-        # REQUIREMENT
+        # REQUIREMENT PREP
         # =========================
         req_long = req.melt(
             id_vars=["BOM Header", "Alt"],
@@ -124,7 +113,7 @@ if st.button("Run MRP"):
         max_level = int(bom["Level"].max())
 
         # =========================
-        # MRP LOGIC
+        # MRP ENGINE
         # =========================
         for lvl in range(1, max_level + 1):
 
@@ -140,7 +129,7 @@ if st.button("Run MRP"):
             if merged.empty:
                 continue
 
-            # Phantom logic
+            # Phantom pass-through
             merged["Required"] = merged.apply(
                 lambda x: x["Demand"] if str(x["Special procurement"]) == "50"
                 else x["Demand"] * x["Quantity"],
@@ -160,7 +149,7 @@ if st.button("Run MRP"):
 
             results.append(grouped)
 
-            # 🔥 FIX: CONSOLIDATE DEMAND
+            # 🔥 CRITICAL FIX (NO DOUBLE COUNTING)
             grouped["Demand"] = grouped["Shortage"]
 
             current = grouped.groupby(
@@ -182,10 +171,10 @@ if st.button("Run MRP"):
         st.dataframe(pivot)
 
         # =========================
-        # DOWNLOAD
+        # DOWNLOAD EXCEL
         # =========================
         output = BytesIO()
-        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
             pivot.to_excel(writer, index=False)
 
         st.download_button(
