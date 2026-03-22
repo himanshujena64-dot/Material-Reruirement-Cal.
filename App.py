@@ -14,14 +14,18 @@ if st.button("Run MRP"):
     if bom_file and req_file:
 
         # =========================
-        # LOAD FILES
+        # SAFE EXCEL LOAD (FIXED)
         # =========================
-        bom = pd.read_excel(bom_file, dtype=str)
-        req = pd.read_excel(req_file, sheet_name="Requirement", dtype=str)
-        stock = pd.read_excel(req_file, sheet_name="Stock", dtype=str)
+        try:
+            bom = pd.read_excel(bom_file, dtype=str, engine="openpyxl")
+            req = pd.read_excel(req_file, sheet_name="Requirement", dtype=str, engine="openpyxl")
+            stock = pd.read_excel(req_file, sheet_name="Stock", dtype=str, engine="openpyxl")
+        except Exception as e:
+            st.error(f"Error reading Excel file: {e}")
+            st.stop()
 
         # =========================
-        # CLEAN
+        # CLEAN COLUMNS
         # =========================
         bom.columns = bom.columns.str.strip()
         req.columns = req.columns.str.strip()
@@ -30,6 +34,9 @@ if st.button("Run MRP"):
         bom.rename(columns={"Alt.": "Alt"}, inplace=True)
         req.rename(columns={"Alt.": "Alt"}, inplace=True)
 
+        # =========================
+        # NORMALIZE MATERIAL
+        # =========================
         def normalize(x):
             if pd.isna(x):
                 return ""
@@ -44,7 +51,7 @@ if st.button("Run MRP"):
         req["BOM Header"] = req["BOM Header"].apply(normalize)
 
         # =========================
-        # NUMERIC
+        # NUMERIC FIX
         # =========================
         bom["Level"] = pd.to_numeric(bom["Level"], errors="coerce")
 
@@ -53,12 +60,15 @@ if st.button("Run MRP"):
 
         bom["Quantity"] = pd.to_numeric(bom["Quantity"], errors="coerce").fillna(0)
 
+        # =========================
+        # FIX STOCK (COMMA ISSUE)
+        # =========================
         stock = stock.rename(columns={"Quantity": "Stock"})
         stock["Stock"] = stock["Stock"].astype(str).str.replace(",", "")
         stock["Stock"] = pd.to_numeric(stock["Stock"], errors="coerce").fillna(0)
 
         # =========================
-        # CREATE PARENT
+        # CREATE PARENT COMPONENT
         # =========================
         parents = []
         stack = {}
@@ -78,7 +88,7 @@ if st.button("Run MRP"):
         bom["Parent Component"] = parents
 
         # =========================
-        # REQUIREMENT
+        # PREPARE REQUIREMENT
         # =========================
         req_long = req.melt(
             id_vars=["BOM Header", "Alt"],
@@ -112,7 +122,7 @@ if st.button("Run MRP"):
             if merged.empty:
                 continue
 
-            # Phantom logic
+            # Phantom pass-through logic
             merged["Required"] = merged.apply(
                 lambda x: x["Demand"] if str(x["Special procurement"]) == "50"
                 else x["Demand"] * x["Quantity"],
@@ -132,7 +142,7 @@ if st.button("Run MRP"):
 
             results.append(grouped)
 
-            # 🔥 FIX: CONSOLIDATE DEMAND
+            # 🔥 CRITICAL FIX: CONSOLIDATE DEMAND
             grouped["Demand"] = grouped["Shortage"]
 
             current = grouped.groupby(
@@ -154,7 +164,7 @@ if st.button("Run MRP"):
         st.dataframe(pivot)
 
         # Download button
-        csv = pivot.to_csv(index=False).encode('utf-8')
+        csv = pivot.to_csv(index=False).encode("utf-8")
         st.download_button("Download Output", csv, "MRP_Output.csv", "text/csv")
 
     else:
