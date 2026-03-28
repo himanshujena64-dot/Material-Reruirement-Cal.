@@ -3,9 +3,9 @@ import pandas as pd
 from io import BytesIO
 
 # --- 1. PAGE CONFIG ---
-st.set_page_config(page_title="MRP App-2", page_icon="⚙️", layout="wide")
+st.set_page_config(page_title="MRP Shortage Tool", page_icon="⚙️", layout="wide")
 
-# --- 2. LOGIN SYSTEM ---
+# --- 2. LOGIN SYSTEM (Preserved) ---
 def check_password():
     if "password_correct" not in st.session_state:
         st.session_state["password_correct"] = False
@@ -17,7 +17,6 @@ def check_password():
     pas = st.text_input("Passcode", type="password", key="password")
     
     if st.button("Login"):
-        # Accessing secrets for passwords
         if user in st.secrets["passwords"] and pas == st.secrets["passwords"][user]:
             st.session_state["password_correct"] = True
             st.rerun()
@@ -25,39 +24,9 @@ def check_password():
             st.error("😕 Access Denied")
     return False
 
-# --- 3. MRP LOGIC ---
-def calculate_recursive_demand(parent_pn, current_demand, current_level, target_pn, bom_df, stock_dict):
-    total_gross_for_target = 0
-    parent_pn_str = str(parent_pn).strip()
-    
-    # Filter for Alt 10 children
-    children = bom_df[(bom_df['BOM Header'].astype(str).str.strip() == parent_pn_str) & 
-                      (bom_df['Level'] == current_level + 1) & 
-                      (bom_df['Alt'].astype(str).str.contains("10"))]
-    
-    for _, row in children.iterrows():
-        child_pn = str(row['Component']).strip()
-        req_qty = float(row['Required Qty'])
-        is_phantom = str(row.get('SP', '')).strip() == "50"
-        
-        child_gross_req = current_demand * req_qty
-        
-        if child_pn == target_pn:
-            total_gross_for_target += child_gross_req
-        else:
-            child_stock = float(stock_dict.get(child_pn, 0))
-            # Phantom passes demand, Regular subtracts stock
-            pass_down_qty = child_gross_req if is_phantom else max(0, child_gross_req - child_stock)
-            
-            if pass_down_qty > 0:
-                total_gross_for_target += calculate_recursive_demand(
-                    child_pn, pass_down_qty, current_level + 1, target_pn, bom_df, stock_dict
-                )
-    return total_gross_for_target
-
-# --- 4. THE APP ---
+# --- 3. THE APP ---
 if check_password():
-    st.title("⚙️ MRP Shortage Analysis Dashboard (App-2)")
+    st.title("📊 MRP Shortage Analysis Dashboard")
     
     with st.sidebar:
         st.success("✅ Access Granted")
@@ -68,83 +37,131 @@ if check_password():
         st.header("📂 Data Upload")
         bom_file = st.file_uploader("1. BOM Master File", type=["xlsx", "xls", "xlsb"])
         req_file = st.file_uploader("2. Req & Stock File", type=["xlsx", "xls", "xlsb"])
-        target_pn_input = st.text_input("Target Component PN", value="0010300601DEL")
 
+    # SAFE EXCEL READER (Preserved)
     def read_excel_safe(uploaded_file, sheet_name=None):
         uploaded_file.seek(0)
         for engine in ["openpyxl", "pyxlsb", "xlrd"]:
             try:
-                return pd.read_excel(uploaded_file, sheet_name=sheet_name, engine=engine)
+                return pd.read_excel(uploaded_file, sheet_name=sheet_name, dtype=str, engine=engine)
             except:
                 continue
-        return pd.read_excel(uploaded_file, sheet_name=sheet_name)
+        return pd.read_excel(uploaded_file, sheet_name=sheet_name, dtype=str)
 
     if bom_file and req_file:
         if st.sidebar.button("🚀 Run MRP Engine"):
-            try:
-                # 1. Load Data
+            with st.spinner("Processing All Components..."):
+                # 1. LOAD DATA
                 bom = read_excel_safe(bom_file, sheet_name=0)
-                
-                # Auto-detect sheets
-                xls_data = pd.ExcelFile(req_file)
-                req_sheet = [s for s in xls_data.sheet_names if 'Req' in s][0]
-                stock_sheet = [s for s in xls_data.sheet_names if 'Stock' in s][0]
-                
-                req = read_excel_safe(req_file, sheet_name=req_sheet)
-                stock = read_excel_safe(req_file, sheet_name=stock_sheet)
+                req = read_excel_safe(req_file, sheet_name="Requirement")
+                stock = read_excel_safe(req_file, sheet_name="Stock")
 
-                # 2. CLEANING & DATE FIXING
-                # Convert all column names to string and strip spaces
-                req.columns = [str(c).strip() for c in req.columns]
+                # 2. CLEAN & NORMALIZE (Preserved)
+                # Robust column cleaning to avoid 'Jan-26' KeyError
                 bom.columns = [str(c).strip() for c in bom.columns]
+                req.columns = [str(c).strip() for c in req.columns]
                 stock.columns = [str(c).strip() for c in stock.columns]
                 
-                # Normalize BOM columns
-                bom.rename(columns={"Alt.": "Alt", "Special procurement": "SP", "SP type": "SP"}, inplace=True)
+                bom.rename(columns={"Alt.": "Alt", "SP type": "SP", "Special procurement": "SP"}, inplace=True)
+                req.rename(columns={"Alt.": "Alt"}, inplace=True)
 
-                # 3. LOCATE 'Jan-26' COLUMN (The most robust way)
-                # This finds the column even if it's a date or has extra text
-                month_cols = [c for c in req.columns if 'Jan-26' in c or '2026-01' in c]
-                if not month_cols:
-                    st.error(f"Could not find 'Jan-26' column. Available: {list(req.columns)}")
-                    st.stop()
-                target_month = month_cols[0]
+                def normalize(x):
+                    if pd.isna(x): return ""
+                    x = str(x).strip()
+                    if x.endswith(".0"): x = x[:-2]
+                    return x.zfill(10)
 
-                # 4. PREP STOCK
-                stock_q_col = [c for c in stock.columns if 'Quantity' in c or 'Stock' in c][0]
-                stock_dict = pd.Series(stock[stock_q_col].values, 
-                                       index=stock['Component'].astype(str).str.strip()).to_dict()
+                bom["Component"] = bom["Component"].apply(normalize)
+                bom["BOM Header"] = bom["BOM Header"].apply(normalize)
+                stock["Component"] = stock["Component"].apply(normalize)
+                req["BOM Header"] = req["BOM Header"].apply(normalize)
 
-                # 5. EXPLOSION
-                total_gross = 0
-                rows = list(req.iterrows())
-                progress_bar = st.progress(0)
+                # 4. NUMERIC FIX (Preserved)
+                bom["Level"] = pd.to_numeric(bom["Level"], errors="coerce")
+                if "Required Qty" in bom.columns:
+                    bom["Quantity"] = bom["Required Qty"]
+                bom["Quantity"] = pd.to_numeric(bom["Quantity"], errors="coerce").fillna(0)
                 
-                for i, (_, row) in enumerate(rows):
-                    h_pn = str(row['BOM Header']).strip()
-                    # Ensure demand is treated as a number
-                    h_demand = pd.to_numeric(row[target_month], errors='coerce') or 0
+                stock = stock.rename(columns={"Quantity": "Stock"})
+                stock["Stock"] = stock["Stock"].astype(str).str.replace(",", "")
+                stock["Stock"] = pd.to_numeric(stock["Stock"], errors="coerce").fillna(0)
+
+                # 5. BUILD PARENT RELATIONSHIP (Preserved)
+                parents = []
+                stack_tracker = {}
+                for i in range(len(bom)):
+                    lvl = bom.loc[i, "Level"]
+                    comp = bom.loc[i, "Component"]
+                    p_id = bom.loc[i, "BOM Header"] if lvl == 1 else stack_tracker.get(lvl - 1)
+                    parents.append(p_id)
+                    stack_tracker[lvl] = comp
+                bom["Parent Component"] = parents
+
+                # 6. EXPLOSION PREP
+                # Melt requirements to handle all months (Jan-26, Feb-26, etc.)
+                req_long = req.melt(id_vars=["BOM Header", "Alt"], var_name="Month", value_name="Demand")
+                req_long["Demand"] = pd.to_numeric(req_long["Demand"], errors="coerce").fillna(0)
+                req_long = req_long[req_long["Demand"] > 0].rename(columns={"BOM Header": "Parent Component"})
+
+                # 7. MRP ENGINE (FIXED LOGIC)
+                current = req_long.copy()
+                results = []
+                max_level = int(bom["Level"].max())
+
+                for lvl in range(1, max_level + 1):
+                    level_bom = bom[bom["Level"] == lvl]
                     
-                    if h_demand > 0:
-                        total_gross += calculate_recursive_demand(
-                            h_pn, h_demand, 0, target_pn_input, bom, stock_dict
-                        )
-                    progress_bar.progress((i + 1) / len(rows))
-                
-                # 6. FINAL RESULTS
-                on_hand = float(stock_dict.get(target_pn_input, 0))
-                shortage = max(0, total_gross - on_hand)
+                    # Merge current demand with BOM components at this level
+                    merged = current.merge(
+                        level_bom,
+                        on=["Parent Component", "Alt"],
+                        how="inner"
+                    )
 
-                st.divider()
-                c1, c2, c3 = st.columns(3)
-                c1.metric("Total Gross Req", f"{total_gross:,.2f}")
-                c2.metric("Stock on Hand", f"{on_hand:,.2f}")
-                c3.metric("Net Shortage", f"{shortage:,.2f}")
+                    if merged.empty:
+                        continue
 
-                if shortage > 0:
-                    st.error(f"Need to procure: {shortage:,.2f} units")
+                    # Multiplication: Demand * Qty
+                    merged["Gross_Req"] = merged["Demand"] * merged["Quantity"]
+
+                    # Subtract stock (unless it is a Phantom SP=50)
+                    merged = merged.merge(stock, on="Component", how="left")
+                    merged["Stock"] = merged["Stock"].fillna(0)
+                    
+                    def calc_shortage(row):
+                        if str(row["SP"]) == "50":
+                            return row["Gross_Req"] # Phantom passes 100% demand
+                        return max(0, row["Gross_Req"] - row["Stock"]) # Regular consumes stock
+
+                    merged["Shortage"] = merged.apply(calc_shortage, axis=1)
+
+                    # Store result for report (Total Required before stock consumption)
+                    results.append(merged[["Component", "Month", "Gross_Req"]])
+
+                    # Next Level uses Shortage as the new Demand
+                    current = merged[["Component", "Month", "Alt", "Shortage"]].rename(
+                        columns={"Component": "Parent Component", "Shortage": "Demand"}
+                    )
+
+                # 8. FINAL REPORTING (Pivot all months)
+                if results:
+                    all_data = pd.concat(results, ignore_index=True)
+                    summary = all_data.groupby(["Component", "Month"])["Gross_Req"].sum().unstack().fillna(0).reset_index()
+                    
+                    # Merge with basic info and stock for final table
+                    final_pivot = summary.merge(stock, on="Component", how="left").fillna(0)
+                    extra_info = bom[["Component", "Component descriptio", "Procurement type", "SP"]].drop_duplicates(subset=["Component"])
+                    final_pivot = final_pivot.merge(extra_info, on="Component", how="left")
+
+                    # Display
+                    st.success("Analysis Complete for All Components")
+                    st.dataframe(final_pivot, use_container_width=True)
+
+                    # Export
+                    output = BytesIO()
+                    final_pivot.to_excel(output, index=False)
+                    st.download_button("📥 Download Full MRP Report", output.getvalue(), "MRP_All_Components.xlsx")
                 else:
-                    st.success("Sufficient stock available.")
-
-            except Exception as e:
-                st.error(f"Application Error: {e}")
+                    st.warning("No requirements were generated. Check your BOM and Requirement files.")
+    else:
+        st.info("Please upload BOM and Requirement/Stock files to proceed.")
