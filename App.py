@@ -5,7 +5,7 @@ from io import BytesIO
 # --- 1. PAGE CONFIG ---
 st.set_page_config(page_title="MRP Shortage Tool", page_icon="⚙️", layout="wide")
 
-# --- 2. LOGIN SYSTEM (Preserved) ---
+# --- 2. LOGIN SYSTEM ---
 def check_password():
     if "password_correct" not in st.session_state:
         st.session_state["password_correct"] = False
@@ -49,13 +49,13 @@ if check_password():
 
     if bom_file and req_file:
         if st.sidebar.button("🚀 Run MRP Engine"):
-            with st.spinner("Processing All Components..."):
+            with st.spinner("Calculating..."):
                 # 1. LOAD DATA
                 bom = read_excel_safe(bom_file, sheet_name=0)
                 req = read_excel_safe(req_file, sheet_name="Requirement")
                 stock = read_excel_safe(req_file, sheet_name="Stock")
 
-                # 2. CLEAN & NORMALIZE
+                # 2. CLEAN COLUMN NAMES
                 bom.columns = [str(c).strip() for c in bom.columns]
                 req.columns = [str(c).strip() for c in req.columns]
                 stock.columns = [str(c).strip() for c in stock.columns]
@@ -63,25 +63,25 @@ if check_password():
                 bom.rename(columns={"Alt.": "Alt", "SP type": "SP", "Special procurement": "SP"}, inplace=True)
                 req.rename(columns={"Alt.": "Alt"}, inplace=True)
 
+                # 3. NORMALIZE FUNCTION (Force text and remove .0)
                 def normalize(x):
                     if pd.isna(x): return ""
                     x = str(x).strip()
                     if x.endswith(".0"): x = x[:-2]
-                    return x.zfill(10)
+                    return x.upper() # Use Uppercase to ensure matches
 
                 bom["Component"] = bom["Component"].apply(normalize)
                 bom["BOM Header"] = bom["BOM Header"].apply(normalize)
                 stock["Component"] = stock["Component"].apply(normalize)
                 req["BOM Header"] = req["BOM Header"].apply(normalize)
 
+                # Numeric conversions
                 bom["Level"] = pd.to_numeric(bom["Level"], errors="coerce")
                 bom["Quantity"] = pd.to_numeric(bom.get("Required Qty", bom.get("Quantity", 0)), errors="coerce").fillna(0)
-                
                 stock = stock.rename(columns={"Quantity": "Stock"})
-                stock["Stock"] = stock["Stock"].astype(str).str.replace(",", "")
-                stock["Stock"] = pd.to_numeric(stock["Stock"], errors="coerce").fillna(0)
+                stock["Stock"] = pd.to_numeric(stock["Stock"].astype(str).str.replace(",", ""), errors="coerce").fillna(0)
 
-                # 3. BUILD PARENTS
+                # 4. BUILD PARENTS
                 parents = []
                 stack_tracker = {}
                 for i in range(len(bom)):
@@ -92,8 +92,7 @@ if check_password():
                     stack_tracker[lvl] = comp
                 bom["Parent Component"] = parents
 
-                # 4. EXPLOSION
-                # Identify month columns (anything not Header or Alt)
+                # 5. EXPLOSION PREP
                 id_cols = ["BOM Header", "Alt"]
                 month_cols = [c for c in req.columns if c not in id_cols]
                 
@@ -103,52 +102,56 @@ if check_password():
 
                 current = req_long.copy()
                 results = []
-                max_level = int(bom["Level"].max())
+                max_lvl = int(bom["Level"].max())
 
-                for lvl in range(1, max_level + 1):
+                # 6. ENGINE LOOP
+                for lvl in range(1, max_lvl + 1):
                     level_bom = bom[bom["Level"] == lvl]
                     merged = current.merge(level_bom, on=["Parent Component", "Alt"], how="inner")
 
-                    if merged.empty: continue
+                    if merged.empty:
+                        continue
 
                     merged["Gross_Req"] = merged["Demand"] * merged["Quantity"]
                     merged = merged.merge(stock, on="Component", how="left")
                     merged["Stock"] = merged["Stock"].fillna(0)
                     
-                    # Logic: Phantom (50) ignores stock and passes full demand
+                    # Shortage Logic: Phantom (50) ignores stock
                     merged["Shortage"] = merged.apply(
                         lambda x: x["Gross_Req"] if str(x["SP"]) == "50" else max(0, x["Gross_Req"] - x["Stock"]),
                         axis=1
                     )
 
-                    # Keep essential columns for the final report
-                    results.append(merged[["Component", "Month", "Gross_Req"]])
+                    # Only append if we actually have data
+                    if not merged.empty:
+                        results.append(merged[["Component", "Month", "Gross_Req"]])
 
                     # Prep next level
                     current = merged[["Component", "Month", "Alt", "Shortage"]].rename(
                         columns={"Component": "Parent Component", "Shortage": "Demand"}
                     )
 
-                # 5. FINAL REPORTING
+                # 7. OUTPUT
                 if results:
                     all_data = pd.concat(results, ignore_index=True)
-                    # Check if 'Month' exists before grouping
-                    if "Month" in all_data.columns:
+                    if not all_data.empty and "Month" in all_data.columns:
                         summary = all_data.groupby(["Component", "Month"])["Gross_Req"].sum().unstack().fillna(0).reset_index()
-                        final_pivot = summary.merge(stock, on="Component", how="left").fillna(0)
                         
-                        extra_info = bom[["Component", "Component descriptio", "Procurement type", "SP"]].drop_duplicates(subset=["Component"])
-                        final_pivot = final_pivot.merge(extra_info, on="Component", how="left")
+                        # Add metadata and stock for final view
+                        final_pivot = summary.merge(stock, on="Component", how="left").fillna(0)
+                        extra = bom[["Component", "Component descriptio", "Procurement type", "SP"]].drop_duplicates(subset=["Component"])
+                        final_pivot = final_pivot.merge(extra, on="Component", how="left")
 
-                        st.success("Analysis Complete!")
+                        st.success("✅ MRP Run Successful")
                         st.dataframe(final_pivot, use_container_width=True)
 
                         output = BytesIO()
                         final_pivot.to_excel(output, index=False)
-                        st.download_button("📥 Download Full Report", output.getvalue(), "MRP_Final_Report.xlsx")
+                        st.download_button("📥 Download Excel Report", output.getvalue(), "MRP_Final_Summary.xlsx")
                     else:
-                        st.error("Data processing failed: 'Month' column lost during explosion.")
+                        st.error("No valid data found in final aggregation.")
                 else:
-                    st.warning("No requirements found. Please check if BOM Headers and Levels match the Requirement file.")
+                    st.warning("No matches found between Requirement file and BOM Master.")
+
     else:
-        st.info("Please upload both files to begin.")
+        st.info("Upload your BOM and Requirement files to start.")
