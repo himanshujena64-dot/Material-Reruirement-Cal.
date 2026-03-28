@@ -38,7 +38,6 @@ if check_password():
         bom_file = st.file_uploader("1. BOM Master File", type=["xlsx", "xls", "xlsb"])
         req_file = st.file_uploader("2. Req & Stock File", type=["xlsx", "xls", "xlsb"])
 
-    # SAFE EXCEL READER (Preserved)
     def read_excel_safe(uploaded_file, sheet_name=None):
         uploaded_file.seek(0)
         for engine in ["openpyxl", "pyxlsb", "xlrd"]:
@@ -56,8 +55,7 @@ if check_password():
                 req = read_excel_safe(req_file, sheet_name="Requirement")
                 stock = read_excel_safe(req_file, sheet_name="Stock")
 
-                # 2. CLEAN & NORMALIZE (Preserved)
-                # Robust column cleaning to avoid 'Jan-26' KeyError
+                # 2. CLEAN & NORMALIZE
                 bom.columns = [str(c).strip() for c in bom.columns]
                 req.columns = [str(c).strip() for c in req.columns]
                 stock.columns = [str(c).strip() for c in stock.columns]
@@ -76,17 +74,14 @@ if check_password():
                 stock["Component"] = stock["Component"].apply(normalize)
                 req["BOM Header"] = req["BOM Header"].apply(normalize)
 
-                # 4. NUMERIC FIX (Preserved)
                 bom["Level"] = pd.to_numeric(bom["Level"], errors="coerce")
-                if "Required Qty" in bom.columns:
-                    bom["Quantity"] = bom["Required Qty"]
-                bom["Quantity"] = pd.to_numeric(bom["Quantity"], errors="coerce").fillna(0)
+                bom["Quantity"] = pd.to_numeric(bom.get("Required Qty", bom.get("Quantity", 0)), errors="coerce").fillna(0)
                 
                 stock = stock.rename(columns={"Quantity": "Stock"})
                 stock["Stock"] = stock["Stock"].astype(str).str.replace(",", "")
                 stock["Stock"] = pd.to_numeric(stock["Stock"], errors="coerce").fillna(0)
 
-                # 5. BUILD PARENT RELATIONSHIP (Preserved)
+                # 3. BUILD PARENTS
                 parents = []
                 stack_tracker = {}
                 for i in range(len(bom)):
@@ -97,71 +92,63 @@ if check_password():
                     stack_tracker[lvl] = comp
                 bom["Parent Component"] = parents
 
-                # 6. EXPLOSION PREP
-                # Melt requirements to handle all months (Jan-26, Feb-26, etc.)
-                req_long = req.melt(id_vars=["BOM Header", "Alt"], var_name="Month", value_name="Demand")
+                # 4. EXPLOSION
+                # Identify month columns (anything not Header or Alt)
+                id_cols = ["BOM Header", "Alt"]
+                month_cols = [c for c in req.columns if c not in id_cols]
+                
+                req_long = req.melt(id_vars=id_cols, value_vars=month_cols, var_name="Month", value_name="Demand")
                 req_long["Demand"] = pd.to_numeric(req_long["Demand"], errors="coerce").fillna(0)
                 req_long = req_long[req_long["Demand"] > 0].rename(columns={"BOM Header": "Parent Component"})
 
-                # 7. MRP ENGINE (FIXED LOGIC)
                 current = req_long.copy()
                 results = []
                 max_level = int(bom["Level"].max())
 
                 for lvl in range(1, max_level + 1):
                     level_bom = bom[bom["Level"] == lvl]
-                    
-                    # Merge current demand with BOM components at this level
-                    merged = current.merge(
-                        level_bom,
-                        on=["Parent Component", "Alt"],
-                        how="inner"
-                    )
+                    merged = current.merge(level_bom, on=["Parent Component", "Alt"], how="inner")
 
-                    if merged.empty:
-                        continue
+                    if merged.empty: continue
 
-                    # Multiplication: Demand * Qty
                     merged["Gross_Req"] = merged["Demand"] * merged["Quantity"]
-
-                    # Subtract stock (unless it is a Phantom SP=50)
                     merged = merged.merge(stock, on="Component", how="left")
                     merged["Stock"] = merged["Stock"].fillna(0)
                     
-                    def calc_shortage(row):
-                        if str(row["SP"]) == "50":
-                            return row["Gross_Req"] # Phantom passes 100% demand
-                        return max(0, row["Gross_Req"] - row["Stock"]) # Regular consumes stock
+                    # Logic: Phantom (50) ignores stock and passes full demand
+                    merged["Shortage"] = merged.apply(
+                        lambda x: x["Gross_Req"] if str(x["SP"]) == "50" else max(0, x["Gross_Req"] - x["Stock"]),
+                        axis=1
+                    )
 
-                    merged["Shortage"] = merged.apply(calc_shortage, axis=1)
-
-                    # Store result for report (Total Required before stock consumption)
+                    # Keep essential columns for the final report
                     results.append(merged[["Component", "Month", "Gross_Req"]])
 
-                    # Next Level uses Shortage as the new Demand
+                    # Prep next level
                     current = merged[["Component", "Month", "Alt", "Shortage"]].rename(
                         columns={"Component": "Parent Component", "Shortage": "Demand"}
                     )
 
-                # 8. FINAL REPORTING (Pivot all months)
+                # 5. FINAL REPORTING
                 if results:
                     all_data = pd.concat(results, ignore_index=True)
-                    summary = all_data.groupby(["Component", "Month"])["Gross_Req"].sum().unstack().fillna(0).reset_index()
-                    
-                    # Merge with basic info and stock for final table
-                    final_pivot = summary.merge(stock, on="Component", how="left").fillna(0)
-                    extra_info = bom[["Component", "Component descriptio", "Procurement type", "SP"]].drop_duplicates(subset=["Component"])
-                    final_pivot = final_pivot.merge(extra_info, on="Component", how="left")
+                    # Check if 'Month' exists before grouping
+                    if "Month" in all_data.columns:
+                        summary = all_data.groupby(["Component", "Month"])["Gross_Req"].sum().unstack().fillna(0).reset_index()
+                        final_pivot = summary.merge(stock, on="Component", how="left").fillna(0)
+                        
+                        extra_info = bom[["Component", "Component descriptio", "Procurement type", "SP"]].drop_duplicates(subset=["Component"])
+                        final_pivot = final_pivot.merge(extra_info, on="Component", how="left")
 
-                    # Display
-                    st.success("Analysis Complete for All Components")
-                    st.dataframe(final_pivot, use_container_width=True)
+                        st.success("Analysis Complete!")
+                        st.dataframe(final_pivot, use_container_width=True)
 
-                    # Export
-                    output = BytesIO()
-                    final_pivot.to_excel(output, index=False)
-                    st.download_button("📥 Download Full MRP Report", output.getvalue(), "MRP_All_Components.xlsx")
+                        output = BytesIO()
+                        final_pivot.to_excel(output, index=False)
+                        st.download_button("📥 Download Full Report", output.getvalue(), "MRP_Final_Report.xlsx")
+                    else:
+                        st.error("Data processing failed: 'Month' column lost during explosion.")
                 else:
-                    st.warning("No requirements were generated. Check your BOM and Requirement files.")
+                    st.warning("No requirements found. Please check if BOM Headers and Levels match the Requirement file.")
     else:
-        st.info("Please upload BOM and Requirement/Stock files to proceed.")
+        st.info("Please upload both files to begin.")
