@@ -2,218 +2,144 @@ import streamlit as st
 import pandas as pd
 from io import BytesIO
 
-# ================= PAGE CONFIG =================
-st.set_page_config(page_title="MRP Shortage Tool", page_icon="⚙️", layout="wide")
-st.title("📊 MRP Shortage Analysis Dashboard")
+st.set_page_config(page_title="MRP Tool", layout="wide")
+st.title("📊 MRP Shortage Dashboard")
 
-# ================= SIDEBAR =================
+# ---------------- FILE UPLOAD ----------------
 with st.sidebar:
-    st.header("📂 Data Upload")
-    bom_file = st.file_uploader("1. BOM Master File", type=["xlsx", "xls", "xlsb"])
-    req_file = st.file_uploader("2. Req & Stock File", type=["xlsx", "xls", "xlsb"])
+    bom_file = st.file_uploader("BOM File", type=["xlsx"])
+    req_file = st.file_uploader("Requirement File", type=["xlsx"])
 
-# ================= UTILITIES =================
-def read_excel_safe(uploaded_file, sheet_name=None):
-    """Robust Excel reader (handles dict + engine fallback)"""
+# ---------------- SAFE READ ----------------
+def read_excel(file, sheet=None):
     try:
-        uploaded_file.seek(0)
-
-        # Try openpyxl first (best for cloud)
-        try:
-            data = pd.read_excel(uploaded_file, sheet_name=sheet_name, dtype=str, engine="openpyxl")
-        except:
-            uploaded_file.seek(0)
-            data = pd.read_excel(uploaded_file, sheet_name=sheet_name, dtype=str)
-
-        # Handle dict return (CRITICAL FIX)
-        if isinstance(data, dict):
-            if sheet_name and sheet_name in data:
-                return data[sheet_name]
-            return list(data.values())[0]
-
-        return data
-
+        file.seek(0)
+        df = pd.read_excel(file, sheet_name=sheet, engine="openpyxl")
+        if isinstance(df, dict):
+            return list(df.values())[0]
+        return df
     except Exception as e:
-        st.error(f"❌ Excel read failed ({sheet_name}): {e}")
+        st.error(f"Read error: {e}")
         return None
 
-
 def normalize(x):
-    if pd.isna(x):
-        return ""
-    x = str(x).strip()
-    if x.endswith(".0"):
-        x = x[:-2]
-    return x.upper()
+    if pd.isna(x): return ""
+    return str(x).strip().replace(".0","").upper()
 
-
-# ================= MAIN ENGINE =================
+# ---------------- MAIN ----------------
 if bom_file and req_file:
 
-    if st.sidebar.button("🚀 Run MRP Engine"):
+    if st.sidebar.button("Run"):
 
-        with st.spinner("Calculating Requirements..."):
+        with st.spinner("Processing..."):
 
-            try:
-                # ---------- LOAD FILES ----------
-                bom = read_excel_safe(bom_file)
-                req = read_excel_safe(req_file, "Requirement")
-                stock = read_excel_safe(req_file, "Stock")
+            bom = read_excel(bom_file)
+            req = read_excel(req_file, "Requirement")
+            stock = read_excel(req_file, "Stock")
 
-                # ---------- VALIDATION ----------
-                if not isinstance(bom, pd.DataFrame):
-                    st.error("❌ BOM not read correctly")
-                    st.stop()
+            if any(x is None for x in [bom, req, stock]):
+                st.stop()
 
-                if not isinstance(req, pd.DataFrame):
-                    st.error("❌ 'Requirement' sheet missing")
-                    st.stop()
+            # ---------- CLEAN ----------
+            bom.columns = bom.columns.str.strip()
+            req.columns = req.columns.str.strip()
+            stock.columns = stock.columns.str.strip()
 
-                if not isinstance(stock, pd.DataFrame):
-                    st.error("❌ 'Stock' sheet missing")
-                    st.stop()
+            bom["Component"] = bom["Component"].apply(normalize)
+            bom["BOM Header"] = bom["BOM Header"].apply(normalize)
+            stock["Component"] = stock["Component"].apply(normalize)
+            req["BOM Header"] = req["BOM Header"].apply(normalize)
 
-                # ---------- CLEAN COLUMN NAMES ----------
-                bom.columns = [str(c).strip() for c in bom.columns]
-                req.columns = [str(c).strip() for c in req.columns]
-                stock.columns = [str(c).strip() for c in stock.columns]
+            bom["Level"] = pd.to_numeric(bom["Level"], errors="coerce").fillna(0)
 
-                bom.rename(columns={"Alt.": "Alt", "SP type": "SP", "Special procurement": "SP"}, inplace=True)
-                req.rename(columns={"Alt.": "Alt"}, inplace=True)
+            qty_col = "Required Qty" if "Required Qty" in bom.columns else "Quantity"
+            bom["Qty"] = pd.to_numeric(bom[qty_col], errors="coerce").fillna(0)
 
-                # ---------- CHECK REQUIRED COLUMNS ----------
-                for col in ["Component", "BOM Header", "Level"]:
-                    if col not in bom.columns:
-                        st.error(f"❌ Missing column in BOM: {col}")
-                        st.stop()
+            stock = stock.rename(columns={"Quantity": "Stock"})
+            stock["Stock"] = pd.to_numeric(stock["Stock"], errors="coerce").fillna(0)
 
-                if "Component" not in stock.columns:
-                    st.error("❌ 'Component' missing in Stock sheet")
-                    st.stop()
+            # ---------- DEMAND ----------
+            req_long = req.melt(
+                id_vars=["BOM Header","Alt"],
+                var_name="Month",
+                value_name="Demand"
+            )
 
-                # ---------- NORMALIZATION ----------
-                bom["Component"] = bom["Component"].apply(normalize)
-                bom["BOM Header"] = bom["BOM Header"].apply(normalize)
-                stock["Component"] = stock["Component"].apply(normalize)
-                req["BOM Header"] = req["BOM Header"].apply(normalize)
+            req_long["Demand"] = pd.to_numeric(req_long["Demand"], errors="coerce").fillna(0)
+            req_long = req_long[req_long["Demand"] > 0]
 
-                # ---------- NUMERIC CONVERSION ----------
-                bom["Level"] = pd.to_numeric(bom["Level"], errors="coerce").fillna(0)
+            current = req_long.rename(columns={"BOM Header":"Parent Component"})
 
-                if "Required Qty" in bom.columns:
-                    bom["Quantity_Used"] = pd.to_numeric(bom["Required Qty"], errors="coerce").fillna(0)
-                else:
-                    bom["Quantity_Used"] = pd.to_numeric(bom.get("Quantity", 0), errors="coerce").fillna(0)
+            # ---------- OPTIMIZED EXPLOSION ----------
+            results = []
+            max_lvl = int(bom["Level"].max())
 
-                stock = stock.rename(columns={"Quantity": "Stock"})
-                stock["Stock"] = pd.to_numeric(
-                    stock["Stock"].astype(str).str.replace(",", ""),
-                    errors="coerce"
-                ).fillna(0)
+            progress = st.progress(0)
 
-                # ---------- PARENT MAPPING ----------
-                parents = []
-                stack = {}
+            for lvl in range(1, max_lvl + 1):
 
-                for i in range(len(bom)):
-                    lvl = bom.loc[i, "Level"]
-                    parent = bom.loc[i, "BOM Header"] if lvl == 1 else stack.get(lvl - 1)
-                    parents.append(parent)
-                    stack[lvl] = bom.loc[i, "Component"]
+                progress.progress(lvl / max_lvl)
 
-                bom["Parent Component"] = parents
+                level_bom = bom[bom["Level"] == lvl][
+                    ["Parent Component","Component","Alt","Qty","SP"]
+                ]
 
-                # ---------- DEMAND MELT ----------
-                id_cols = ["BOM Header", "Alt"]
-                month_cols = [c for c in req.columns if c not in id_cols]
+                merged = current.merge(level_bom, on=["Parent Component","Alt"], how="inner")
 
-                if not month_cols:
-                    st.error("❌ No demand/month columns found")
-                    st.stop()
+                if merged.empty:
+                    break  # 🔥 early stop (important)
 
-                req_long = req.melt(
-                    id_vars=id_cols,
-                    value_vars=month_cols,
-                    var_name="Month",
-                    value_name="Demand"
+                merged["Gross"] = merged["Demand"] * merged["Qty"]
+
+                # attach stock only once
+                merged = merged.merge(stock, on="Component", how="left")
+                merged["Stock"] = merged["Stock"].fillna(0)
+
+                # shortage
+                merged["Shortage"] = merged.apply(
+                    lambda x: x["Gross"] if str(x.get("SP"))=="50"
+                    else max(0, x["Gross"] - x["Stock"]),
+                    axis=1
                 )
 
-                req_long["Demand"] = pd.to_numeric(req_long["Demand"], errors="coerce").fillna(0)
-                req_long = req_long[req_long["Demand"] > 0]
-                req_long.rename(columns={"BOM Header": "Parent Component"}, inplace=True)
+                # store minimal columns (🔥 reduce memory)
+                results.append(merged[["Component","Month","Gross"]])
 
-                # ---------- MRP EXPLOSION ----------
-                current = req_long.copy()
-                results = []
-                max_lvl = int(bom["Level"].max())
+                # next loop input (🔥 keep small)
+                current = merged[["Component","Month","Alt","Shortage"]].rename(
+                    columns={"Component":"Parent Component","Shortage":"Demand"}
+                )
 
-                for lvl in range(1, max_lvl + 1):
+                # 🔥 LIMIT growth (critical for cloud)
+                if len(current) > 200000:
+                    st.warning("⚠️ Data too large, stopping to avoid crash")
+                    break
 
-                    level_bom = bom[bom["Level"] == lvl]
+            # ---------- FINAL ----------
+            if results:
+                final = pd.concat(results)
 
-                    merged = current.merge(
-                        level_bom,
-                        on=["Parent Component", "Alt"],
-                        how="inner"
-                    )
+                final = (
+                    final.groupby(["Component","Month"])["Gross"]
+                    .sum()
+                    .unstack()
+                    .fillna(0)
+                    .reset_index()
+                )
 
-                    if merged.empty:
-                        continue
+                final = final.merge(stock, on="Component", how="left").fillna(0)
 
-                    merged["Gross_Req"] = merged["Demand"] * merged["Quantity_Used"]
+                st.success("✅ Completed")
+                st.dataframe(final, use_container_width=True)
 
-                    merged = merged.merge(stock, on="Component", how="left")
-                    merged["Stock"] = merged["Stock"].fillna(0)
+                # download
+                output = BytesIO()
+                final.to_excel(output, index=False)
 
-                    # ---------- SHORTAGE LOGIC ----------
-                    merged["Shortage"] = merged.apply(
-                        lambda x: x["Gross_Req"]
-                        if str(x.get("SP")) == "50"
-                        else max(0, x["Gross_Req"] - x["Stock"]),
-                        axis=1
-                    )
+                st.download_button("Download", output.getvalue(), "MRP.xlsx")
 
-                    results.append(merged[["Component", "Month", "Gross_Req"]])
-
-                    current = merged[["Component", "Month", "Alt", "Shortage"]].rename(
-                        columns={
-                            "Component": "Parent Component",
-                            "Shortage": "Demand"
-                        }
-                    )
-
-                # ---------- FINAL OUTPUT ----------
-                if results:
-                    all_data = pd.concat(results, ignore_index=True)
-
-                    final = (
-                        all_data.groupby(["Component", "Month"])["Gross_Req"]
-                        .sum()
-                        .unstack()
-                        .fillna(0)
-                        .reset_index()
-                    )
-
-                    final = final.merge(stock, on="Component", how="left").fillna(0)
-
-                    st.success("✅ MRP Run Successful!")
-                    st.dataframe(final, use_container_width=True)
-
-                    # Download
-                    output = BytesIO()
-                    final.to_excel(output, index=False)
-
-                    st.download_button(
-                        "📥 Download Final Report",
-                        output.getvalue(),
-                        "MRP_Output.xlsx"
-                    )
-
-                else:
-                    st.warning("⚠️ No matching data found")
-
-            except Exception as e:
-                st.error(f"❌ Critical error: {e}")
+            else:
+                st.warning("No result")
 
 else:
-    st.info("Please upload BOM and Requirement/Stock files to proceed.")
+    st.info("Upload files")
