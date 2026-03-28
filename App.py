@@ -4,7 +4,7 @@ from io import BytesIO
 import calendar
 
 st.set_page_config(page_title="MRP Tool", layout="wide")
-st.title("📊 MRP Shortage Tool (Final + Trace)")
+st.title("📊 MRP Shortage Tool (Final Clean Logic)")
 
 # =========================
 # SAFE READ
@@ -55,7 +55,7 @@ if st.button("Run MRP"):
         req = read_excel_safe(req_file, "Requirement")
         stock = read_excel_safe(req_file, "Stock")
 
-        # Clean
+        # Clean columns
         bom.columns = bom.columns.str.strip()
         req.columns = req.columns.str.strip()
         stock.columns = stock.columns.str.strip()
@@ -70,35 +70,36 @@ if st.button("Run MRP"):
         req["BOM Header"] = req["BOM Header"].apply(normalize)
 
         # Numeric
-        bom["Level"] = pd.to_numeric(bom["Level"])
-        bom["Quantity"] = pd.to_numeric(bom["Required Qty"], errors="coerce").fillna(0)
+        bom["Level"] = pd.to_numeric(bom["Level"], errors="coerce")
+        bom["Required Qty"] = pd.to_numeric(bom["Required Qty"], errors="coerce").fillna(0)
 
+        # Stock
         stock = stock.rename(columns={"Quantity":"Stock"})
-        stock["Stock"] = stock["Stock"].astype(str).str.replace(",","")
+        stock["Stock"] = stock["Stock"].astype(str).str.replace(",", "")
         stock["Stock"] = pd.to_numeric(stock["Stock"], errors="coerce").fillna(0)
 
         # =========================
-        # BUILD PARENT
+        # BUILD PARENT RELATION
         # =========================
-        parents=[]
-        stack={}
+        parents = []
+        stack = {}
 
         for i in range(len(bom)):
-            lvl=bom.loc[i,"Level"]
-            comp=bom.loc[i,"Component"]
+            lvl = bom.loc[i, "Level"]
+            comp = bom.loc[i, "Component"]
 
-            if lvl==1:
-                parent=bom.loc[i,"BOM Header"]
+            if lvl == 1:
+                parent = bom.loc[i, "BOM Header"]
             else:
-                parent=stack.get(lvl-1,bom.loc[i,"BOM Header"])
+                parent = stack.get(lvl - 1, bom.loc[i, "BOM Header"])
 
             parents.append(parent)
-            stack[lvl]=comp
+            stack[lvl] = comp
 
-        bom["Parent Component"]=parents
+        bom["Parent Component"] = parents
 
         # =========================
-        # REQUIREMENT
+        # REQUIREMENT PREP
         # =========================
         req_long = req.melt(
             id_vars=["BOM Header","Alt"],
@@ -107,7 +108,7 @@ if st.button("Run MRP"):
         )
 
         req_long["Demand"] = pd.to_numeric(req_long["Demand"], errors="coerce").fillna(0)
-        req_long = req_long[req_long["Demand"]>0]
+        req_long = req_long[req_long["Demand"] > 0]
         req_long = req_long.rename(columns={"BOM Header":"Component"})
 
         current = req_long.copy()
@@ -116,7 +117,7 @@ if st.button("Run MRP"):
         trace_rows = []
 
         # =========================
-        # 🔥 MRP ENGINE (FINAL CORRECT)
+        # 🔥 FINAL MRP ENGINE
         # =========================
         for lvl in range(1, max_level + 1):
 
@@ -134,13 +135,14 @@ if st.button("Run MRP"):
 
             merged["IsPhantom"] = merged["Special procurement"].astype(str).str.strip() == "50"
 
-            phantom = merged[merged["IsPhantom"]].copy()
+            # =========================
+            # NORMAL COMPONENT
+            # =========================
             normal = merged[~merged["IsPhantom"]].copy()
 
-            # NORMAL
-            normal["Required"] = normal["Demand"] * normal["Quantity"]
+            normal["Required"] = normal["Demand"] * normal["Required Qty"]
 
-            # TRACE CAPTURE
+            # TRACE
             for _, r in normal.iterrows():
                 trace_rows.append({
                     "Level": lvl,
@@ -148,13 +150,33 @@ if st.button("Run MRP"):
                     "Component": r["Component_y"],
                     "Month": r["Month"],
                     "Demand_In": r["Demand"],
-                    "Quantity": r["Quantity"],
+                    "Req_Qty": r["Required Qty"],
                     "Phantom": "No",
                     "Required": r["Required"]
                 })
 
+            normal = normal.merge(
+                stock,
+                left_on="Component_y",
+                right_on="Component",
+                how="left"
+            )
+
+            normal["Stock"] = normal["Stock"].fillna(0)
+
+            normal["Shortage"] = (normal["Required"] - normal["Stock"]).clip(lower=0)
+
+            normal_next = normal[[
+                "Component_y","Month","Alt","Shortage"
+            ]].rename(columns={
+                "Component_y":"Component",
+                "Shortage":"Demand"
+            })
+
+            # =========================
             # PHANTOM (PASS THROUGH)
-            phantom["Required"] = phantom["Demand"]
+            # =========================
+            phantom = merged[merged["IsPhantom"]].copy()
 
             for _, r in phantom.iterrows():
                 trace_rows.append({
@@ -163,28 +185,19 @@ if st.button("Run MRP"):
                     "Component": r["Component_y"],
                     "Month": r["Month"],
                     "Demand_In": r["Demand"],
-                    "Quantity": 1,
+                    "Req_Qty": 1,
                     "Phantom": "Yes",
                     "Required": r["Demand"]
                 })
 
-            # GROUP NORMAL
-            normal_g = normal.groupby(
-                ["Component_y","Month","Alt"], as_index=False
-            )["Required"].sum()
-
-            normal_g = normal_g.rename(columns={"Component_y":"Component"})
-            normal_g = normal_g.merge(stock,on="Component",how="left")
-            normal_g["Stock"] = normal_g["Stock"].fillna(0)
-
-            normal_g["Demand"] = (normal_g["Required"] - normal_g["Stock"]).clip(lower=0)
-
-            # PHANTOM PASS
-            phantom_g = phantom[[
+            phantom_next = phantom[[
                 "Component_y","Month","Alt","Demand"
             ]].rename(columns={"Component_y":"Component"})
 
-            current = pd.concat([normal_g, phantom_g], ignore_index=True)
+            # =========================
+            # COMBINE
+            # =========================
+            current = pd.concat([normal_next, phantom_next], ignore_index=True)
 
             current = current.groupby(
                 ["Component","Month","Alt"], as_index=False
@@ -198,7 +211,7 @@ if st.button("Run MRP"):
         pivot = demand.pivot(index="Component", columns="Month", values="Demand").fillna(0).reset_index()
 
         pivot = pivot.merge(stock,on="Component",how="left")
-        pivot["Stock"]=pivot["Stock"].fillna(0)
+        pivot["Stock"] = pivot["Stock"].fillna(0)
 
         extra = bom[[
             "Component","Component descriptio",
@@ -207,11 +220,13 @@ if st.button("Run MRP"):
 
         pivot = pivot.merge(extra,on="Component",how="left")
 
+        # Sort months
         month_cols = sorted(
             [c for c in pivot.columns if "-" in c],
             key=month_sort_key
         )
 
+        # Stock flow
         balance = pivot["Stock"].copy()
 
         for m in month_cols:
@@ -224,19 +239,11 @@ if st.button("Run MRP"):
             "Procurement type","Special procurement","Stock"
         ] + month_cols]
 
-        st.success("✅ FINAL RESULT")
+        st.success("✅ FINAL CORRECT RESULT")
         st.dataframe(pivot, use_container_width=True)
 
         # =========================
-        # 🔍 SEARCH
-        # =========================
-        search = st.text_input("Search Component")
-
-        if search:
-            st.dataframe(pivot[pivot["Component"].str.contains(search)], use_container_width=True)
-
-        # =========================
-        # TRACE OUTPUT
+        # TRACE VIEW
         # =========================
         trace_df = pd.DataFrame(trace_rows)
 
