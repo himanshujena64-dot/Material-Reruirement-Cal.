@@ -2,148 +2,133 @@ import streamlit as st
 import pandas as pd
 from io import BytesIO
 
-st.set_page_config(page_title="MRP Tool", layout="wide")
-st.title("📊 MRP Shortage Dashboard")
+# --- 1. PAGE CONFIG ---
+st.set_page_config(page_title="App-2: MRP Calculation", layout="wide")
+st.title("📊 App-2: MRP Requirement Calculation")
 
-# ---------------- FILE UPLOAD ----------------
+# --- 2. SIDEBAR ---
 with st.sidebar:
-    bom_file = st.file_uploader("1. BOM File", type=["xlsx"])
-    req_file = st.file_uploader("2. Requirement File", type=["xlsx"])
+    st.header("📂 Data Upload")
+    bom_file = st.file_uploader("1. BOM Master File", type=["xlsx"])
+    req_file = st.file_uploader("2. Req & Stock File", type=["xlsx"])
 
-# ---------------- UTILITIES ----------------
-def read_excel(file, sheet=None):
+# --- 3. UTILITIES ---
+def read_excel_safe(uploaded_file, sheet_name=None):
+    uploaded_file.seek(0)
     try:
-        file.seek(0)
-        df = pd.read_excel(file, sheet_name=sheet, engine="openpyxl")
-        if isinstance(df, dict):
-            return list(df.values())[0]
+        # Using openpyxl to ensure decimal precision
+        df = pd.read_excel(uploaded_file, sheet_name=sheet_name, engine="openpyxl")
         return df
     except:
         return None
 
-def clean_cols(df):
-    df.columns = df.columns.str.strip()
-    return df.rename(columns={"Alt.": "Alt", "Special procurement": "SP", "SP type": "SP"})
-
 def normalize(x):
     if pd.isna(x): return ""
-    return str(x).strip().replace(".0","").upper()
+    x = str(x).strip()
+    if x.endswith(".0"): x = x[:-2]
+    return x.upper()
 
-# ---------------- MAIN ----------------
+# --- 4. ENGINE ---
 if bom_file and req_file:
+    if st.sidebar.button("Calculate Requirement"):
+        with st.spinner("Executing Multi-Level Netting..."):
+            try:
+                # A. LOAD DATA
+                bom_raw = read_excel_safe(bom_file)
+                req_raw = read_excel_safe(req_file, "Requirement")
+                stock_raw = read_excel_safe(req_file, "Stock")
 
-    if st.sidebar.button("🚀 Run MRP"):
+                if any(df is None for df in [bom_raw, req_raw, stock_raw]):
+                    st.error("❌ Critical Error: Missing sheets or incorrect file format.")
+                    st.stop()
 
-        try:
-            # ---------- LOAD ----------
-            bom = read_excel(bom_file)
-            req = read_excel(req_file, "Requirement")
-            stock = read_excel(req_file, "Stock")
+                # B. CLEAN & NORMALIZE
+                bom = bom_raw.rename(columns=lambda x: str(x).strip())
+                req = req_raw.rename(columns=lambda x: str(x).strip())
+                stock = stock_raw.rename(columns=lambda x: str(x).strip())
 
-            if any(x is None for x in [bom, req, stock]):
-                st.error("❌ File read failed. Ensure sheets 'Requirement' and 'Stock' exist.")
-                st.stop()
+                for df in [bom, stock]: 
+                    df["Component"] = df["Component"].apply(normalize)
+                bom["BOM Header"] = bom["BOM Header"].apply(normalize)
+                req["BOM Header"] = req["BOM Header"].apply(normalize)
 
-            # ---------- CLEAN ----------
-            bom = clean_cols(bom)
-            req = clean_cols(req)
-            stock = clean_cols(stock)
+                # C. NUMERIC PREP
+                bom["Level"] = pd.to_numeric(bom["Level"], errors="coerce").fillna(0)
+                qty_col = "Required Qty" if "Required Qty" in bom.columns else "Quantity"
+                bom["Qty"] = pd.to_numeric(bom[qty_col], errors="coerce").fillna(0.0)
+                
+                stock = stock.rename(columns={"Quantity": "Stock_Qty"})
+                stock["Stock_Qty"] = pd.to_numeric(stock["Stock_Qty"], errors="coerce").fillna(0.0)
 
-            # ---------- FIX COLUMNS ----------
-            bom["Alt"] = bom.get("Alt", "")
-            req["Alt"] = req.get("Alt", "")
-            bom["SP"] = bom.get("SP", "")
+                # D. INITIAL DEMAND SETUP
+                id_cols = ["BOM Header", "Alt"]
+                month_cols = [c for c in req.columns if c not in id_cols]
+                
+                current_demand = req.melt(id_vars=id_cols, value_vars=month_cols, 
+                                         var_name="Month", value_name="Demand")
+                current_demand["Demand"] = pd.to_numeric(current_demand["Demand"], errors="coerce").fillna(0.0)
+                current_demand = current_demand.rename(columns={"BOM Header": "Parent"})
 
-            # ---------- NORMALIZE ----------
-            bom["Component"] = bom["Component"].apply(normalize)
-            bom["BOM Header"] = bom["BOM Header"].apply(normalize)
-            stock["Component"] = stock["Component"].apply(normalize)
-            req["BOM Header"] = req["BOM Header"].apply(normalize)
+                # E. MULTI-LEVEL EXPLOSION WITH STOCK DEDUCTION
+                results = []
+                max_depth = int(bom["Level"].max())
 
-            # ---------- NUMERIC ----------
-            bom["Level"] = pd.to_numeric(bom["Level"], errors="coerce").fillna(0)
-            qty_col = "Required Qty" if "Required Qty" in bom.columns else "Quantity"
-            bom["Qty"] = pd.to_numeric(bom[qty_col], errors="coerce").fillna(0)
+                for lvl in range(1, max_depth + 1):
+                    bom_lvl = bom[bom["Level"] == lvl][["BOM Header", "Component", "Alt", "Qty", "SP"]]
+                    
+                    # Explode Parent Demand to Components
+                    merged = current_demand.merge(bom_lvl, left_on=["Parent", "Alt"], right_on=["BOM Header", "Alt"], how="inner")
+                    if merged.empty: break
+                    
+                    # Calculate Gross Requirement
+                    merged["Gross"] = merged["Demand"] * merged["Qty"]
+                    
+                    # Merge with Stock
+                    merged = merged.merge(stock[["Component", "Stock_Qty"]], on="Component", how="left")
+                    merged["Stock_Qty"] = merged["Stock_Qty"].fillna(0.0)
+                    
+                    # Calculate Shortage (Net Requirement)
+                    # Note: Using .clip(0) ensures we only pass POSITIVE shortages down to next level
+                    merged["Shortage"] = merged.apply(
+                        lambda x: x["Gross"] if str(x.get("SP")) == "50" else max(0.0, x["Gross"] - x["Stock_Qty"]), 
+                        axis=1
+                    )
+                    
+                    results.append(merged[["Component", "Month", "Gross", "Shortage"]])
+                    
+                    # Net Requirement becomes Demand for next level
+                    current_demand = merged[["Component", "Month", "Alt", "Shortage"]].rename(
+                        columns={"Component": "Parent", "Shortage": "Demand"}
+                    )
 
-            stock = stock.rename(columns={"Quantity": "Stock"})
-            stock["Stock"] = pd.to_numeric(stock["Stock"], errors="coerce").fillna(0)
+                # F. FINAL PIVOT & FORMATTING (Matching your screenshot)
+                if results:
+                    final_data = pd.concat(results, ignore_index=True)
+                    
+                    # Pivot to get Month columns
+                    pivot_df = final_data.groupby(["Component", "Month"])["Gross"].sum().unstack().fillna(0.0)
+                    pivot_df = pivot_df[month_cols] # Ensure original month order
+                    
+                    # Re-attach Master Data (Description, Stock, Procurement Type)
+                    info = bom[["Component", "Component descriptio", "Procurement type", "Special procurement"]].drop_duplicates("Component")
+                    final_report = pivot_df.merge(info, on="Component", how="left")
+                    final_report = final_report.merge(stock[["Component", "Stock_Qty"]], on="Component", how="left")
+                    
+                    # Reorder columns to match your screenshot
+                    cols = ["Component", "Component descriptio", "Procurement type", "Special procurement", "Stock_Qty"] + month_cols
+                    final_report = final_report[cols].rename(columns={"Stock_Qty": "Stock"})
 
-            # ---------- DEMAND ----------
-            id_cols = ["BOM Header", "Alt"]
-            month_cols = [c for c in req.columns if c not in id_cols]
+                    st.success("✅ Calculation Complete")
+                    st.dataframe(final_report, use_container_width=True)
 
-            req_long = req.melt(id_vars=id_cols, value_vars=month_cols,
-                                var_name="Month", value_name="Demand")
+                    # Export to Excel
+                    output = BytesIO()
+                    final_report.to_excel(output, index=False)
+                    st.download_button("📥 Download Report", output.getvalue(), "MRP_Analysis.xlsx")
+                else:
+                    st.warning("⚠️ No matches found between BOM and Requirements.")
 
-            req_long["Demand"] = pd.to_numeric(req_long["Demand"], errors="coerce").fillna(0)
-            req_long = req_long[req_long["Demand"] > 0]
-            req_long = req_long.rename(columns={"BOM Header": "Parent Component"})
-
-            # ---------- EXPLOSION ----------
-            merged = req_long.merge(
-                bom[["BOM Header", "Component", "Alt", "Qty"]],
-                left_on=["Parent Component", "Alt"],
-                right_on=["BOM Header", "Alt"],
-                how="inner"
-            )
-
-            merged["Gross"] = merged["Demand"] * merged["Qty"]
-            result_df = merged[["Component", "Month", "Gross"]]
-
-            # ---------- PIVOT ----------
-            pivot = (
-                result_df.groupby(["Component", "Month"])["Gross"]
-                .sum()
-                .unstack()
-                .fillna(0)
-            )
-            
-            # Ensure all month columns are present and ordered
-            for col in month_cols:
-                if col not in pivot.columns:
-                    pivot[col] = 0
-            pivot = pivot[month_cols] 
-
-            # ---------- STOCK MERGE ----------
-            pivot = pivot.merge(stock.set_index("Component"), left_index=True, right_index=True, how="left").fillna(0)
-
-            # ---------- 🔥 CORRECTED SHORTAGE LOGIC ----------
-            demand_matrix = pivot[month_cols]
-            stock_values = pivot["Stock"].values.reshape(-1, 1)
-            
-            # 1. Cumulative Demand across months
-            cum_demand = demand_matrix.cumsum(axis=1)
-            
-            # 2. Total Shortage needed (Cumulative Demand - Stock, capped at 0)
-            # This represents the total gap to be filled from month 1 to current month
-            total_shortage_needed = (cum_demand - stock_values).clip(lower=0)
-            
-            # 3. Monthly Incremental Shortage
-            # Subtract previous month's total shortage to see what is specifically needed THIS month
-            monthly_shortage = total_shortage_needed.diff(axis=1).fillna(total_shortage_needed)
-            
-            # Update values in the pivot table
-            pivot[month_cols] = monthly_shortage
-
-            pivot = pivot.reset_index()
-
-            # Final Polish: Merge descriptive info if available
-            info_cols = ["Component", "Component descriptio", "Procurement type", "SP"]
-            existing_info = [c for c in info_cols if c in bom.columns]
-            if existing_info:
-                info_df = bom[existing_info].drop_duplicates("Component")
-                pivot = pivot.merge(info_df, on="Component", how="left")
-
-            st.success("✅ MRP Run Successful - Shortage Logic Applied")
-            st.dataframe(pivot, use_container_width=True)
-
-            # ---------- DOWNLOAD ----------
-            output = BytesIO()
-            pivot.to_excel(output, index=False)
-            st.download_button("📥 Download Shortage Report", output.getvalue(), "MRP_Shortage_Results.xlsx")
-
-        except Exception as e:
-            st.error(f"❌ An error occurred: {e}")
-
+            except Exception as e:
+                st.error(f"Error: {e}")
 else:
-    st.info("Please upload your BOM and Requirement files to begin.")
+    st.info("Please upload BOM and Requirement files to start.")
