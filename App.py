@@ -41,7 +41,7 @@ if bom_file and req_file:
             stock = read_excel(req_file, "Stock")
 
             if any(x is None for x in [bom, req, stock]):
-                st.error("❌ File read failed")
+                st.error("❌ File read failed. Ensure sheets 'Requirement' and 'Stock' exist.")
                 st.stop()
 
             # ---------- CLEAN ----------
@@ -79,7 +79,7 @@ if bom_file and req_file:
             req_long = req_long[req_long["Demand"] > 0]
             req_long = req_long.rename(columns={"BOM Header": "Parent Component"})
 
-            # ---------- SIMPLE EXPLOSION (LIMITED SAFE) ----------
+            # ---------- EXPLOSION ----------
             merged = req_long.merge(
                 bom[["BOM Header", "Component", "Alt", "Qty"]],
                 left_on=["Parent Component", "Alt"],
@@ -88,7 +88,6 @@ if bom_file and req_file:
             )
 
             merged["Gross"] = merged["Demand"] * merged["Qty"]
-
             result_df = merged[["Component", "Month", "Gross"]]
 
             # ---------- PIVOT ----------
@@ -98,32 +97,53 @@ if bom_file and req_file:
                 .unstack()
                 .fillna(0)
             )
+            
+            # Ensure all month columns are present and ordered
+            for col in month_cols:
+                if col not in pivot.columns:
+                    pivot[col] = 0
+            pivot = pivot[month_cols] 
 
             # ---------- STOCK MERGE ----------
             pivot = pivot.merge(stock.set_index("Component"), left_index=True, right_index=True, how="left").fillna(0)
 
-            # ---------- 🔥 FAST CUMULATIVE LOGIC ----------
+            # ---------- 🔥 CORRECTED SHORTAGE LOGIC ----------
             demand_matrix = pivot[month_cols]
-
-            # cumulative demand
+            stock_values = pivot["Stock"].values.reshape(-1, 1)
+            
+            # 1. Cumulative Demand across months
             cum_demand = demand_matrix.cumsum(axis=1)
-
-            # stock applied
-            pivot[month_cols] = pivot["Stock"].values.reshape(-1,1) - cum_demand
+            
+            # 2. Total Shortage needed (Cumulative Demand - Stock, capped at 0)
+            # This represents the total gap to be filled from month 1 to current month
+            total_shortage_needed = (cum_demand - stock_values).clip(lower=0)
+            
+            # 3. Monthly Incremental Shortage
+            # Subtract previous month's total shortage to see what is specifically needed THIS month
+            monthly_shortage = total_shortage_needed.diff(axis=1).fillna(total_shortage_needed)
+            
+            # Update values in the pivot table
+            pivot[month_cols] = monthly_shortage
 
             pivot = pivot.reset_index()
 
-            st.success("✅ MRP Completed (Fast & Stable)")
+            # Final Polish: Merge descriptive info if available
+            info_cols = ["Component", "Component descriptio", "Procurement type", "SP"]
+            existing_info = [c for c in info_cols if c in bom.columns]
+            if existing_info:
+                info_df = bom[existing_info].drop_duplicates("Component")
+                pivot = pivot.merge(info_df, on="Component", how="left")
+
+            st.success("✅ MRP Run Successful - Shortage Logic Applied")
             st.dataframe(pivot, use_container_width=True)
 
-            # download
+            # ---------- DOWNLOAD ----------
             output = BytesIO()
             pivot.to_excel(output, index=False)
-
-            st.download_button("📥 Download", output.getvalue(), "MRP.xlsx")
+            st.download_button("📥 Download Shortage Report", output.getvalue(), "MRP_Shortage_Results.xlsx")
 
         except Exception as e:
-            st.error(f"❌ Error: {e}")
+            st.error(f"❌ An error occurred: {e}")
 
 else:
-    st.info("Upload files to start")
+    st.info("Please upload your BOM and Requirement files to begin.")
